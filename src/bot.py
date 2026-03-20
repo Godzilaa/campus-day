@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import tempfile
 from datetime import datetime, timezone
 from uuid import uuid4
@@ -30,11 +31,24 @@ memory = HindsightProjectMemory(
     api_key=settings.hindsight_api_key,
     bank_prefix=settings.hindsight_bank_prefix,
 )
-transcriber = (
-    VoiceTranscriber(api_key=settings.openai_api_key, model=settings.openai_transcribe_model)
-    if settings.openai_api_key
-    else None
-)
+
+if settings.openai_api_key:
+    transcriber = VoiceTranscriber(
+        api_key=settings.openai_api_key,
+        model=settings.openai_transcribe_model,
+    )
+elif settings.groq_api_key:
+    # Groq uses OpenAI-compatible API with different whisper model names.
+    groq_model = settings.openai_transcribe_model
+    if groq_model == "whisper-1":
+        groq_model = "whisper-large-v3-turbo"
+    transcriber = VoiceTranscriber(
+        api_key=settings.groq_api_key,
+        model=groq_model,
+        base_url="https://api.groq.com/openai/v1",
+    )
+else:
+    transcriber = None
 guidance_engine = (
     RoleGuidanceEngine(api_key=settings.groq_api_key, model=settings.groq_model)
     if settings.groq_api_key
@@ -51,7 +65,7 @@ def chat_bank_id(update: Update) -> str:
 
 
 def build_welcome_text() -> str:
-    voice_status = "enabled" if transcriber is not None else "disabled (set OPENAI_API_KEY)"
+    voice_status = "enabled" if transcriber is not None else "disabled (set OPENAI_API_KEY or GROQ_API_KEY)"
     return "\n".join(
         [
             "<b>AI Group Project Manager</b>",
@@ -90,12 +104,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def set_role(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
+    if not update.message or not update.effective_user:
         return
+
+    requester = update.effective_user
 
     if not context.args:
         await update.message.reply_text(
-            "Usage: /setrole <role> (reply) or /setrole @username <role>"
+            "Usage: /setrole <role> (self), reply with /setrole <role>, or /setrole @username <role>"
         )
         return
 
@@ -106,7 +122,6 @@ async def set_role(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         target = update.message.reply_to_message.from_user
         role = " ".join(context.args).strip()
     else:
-        # Prefer explicit text mention entity because it includes the user id.
         entities = update.message.entities or []
         for entity in entities:
             if entity.type == MessageEntityType.TEXT_MENTION and getattr(entity, "user", None) is not None:
@@ -118,7 +133,6 @@ async def set_role(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 role = rest.replace(mention_text, "", 1).strip()
                 break
 
-        # Fallback: /setrole @username <role> (resolve from known stored roles)
         if target is None and context.args and context.args[0].startswith("@"):
             mention_username = context.args[0][1:].strip().lower()
             role = " ".join(context.args[1:]).strip()
@@ -136,15 +150,22 @@ async def set_role(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     target = ResolvedUser(uid=str(row["user_id"]), uname=row["username"] or mention_username)
                     break
 
+        # /setrole <role> => self assignment
+        if target is None and not (context.args and context.args[0].startswith("@")):
+            target = requester
+            role = " ".join(context.args).strip()
+
     if target is None:
         await update.message.reply_text(
-            "Could not resolve the teammate. Use reply mode, or mention from the member picker, "
-            "or use @username after they were assigned once."
+            "Could not resolve the teammate. Use reply mode, mention from member picker, "
+            "or run /setrole <role> to set your own role."
         )
         return
 
     if not role:
-        await update.message.reply_text("Usage: /setrole <role> (reply) or /setrole @username <role>")
+        await update.message.reply_text(
+            "Usage: /setrole <role> (self/reply) or /setrole @username <role>"
+        )
         return
 
     chat_id = str(update.effective_chat.id)
@@ -326,6 +347,17 @@ async def meeting_end(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     session_id = active["session_id"]
     bank_id = chat_bank_id(update)
 
+    transcript_row = storage.get_transcript(chat_id, session_id)
+    if not transcript_row or not str(transcript_row["content"] or "").strip():
+        await update.message.reply_text(
+            "Meeting ended, but no discussion messages were captured. "
+            "This usually means bot privacy mode is ON in Telegram. "
+            "Use BotFather -> /setprivacy -> Disable, then start a new meeting."
+        )
+        storage.clear_active_session(chat_id)
+        storage.clear_transcript(chat_id, session_id)
+        return
+
     try:
         summary = await memory.meeting_summary(bank_id=bank_id, chat_id=chat_id, session_id=session_id)
     except Exception as exc:
@@ -333,6 +365,59 @@ async def meeting_end(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text("Meeting ended, but summary generation failed.")
     else:
         await update.message.reply_text(f"Meeting summary:\n{summary}")
+
+    try:
+        extracted_tasks = await memory.extract_action_items(
+            bank_id=bank_id,
+            chat_id=chat_id,
+            session_id=session_id,
+        )
+    except Exception as exc:
+        logger.exception("task extraction failed", exc_info=exc)
+        extracted_tasks = []
+
+    created_lines: list[str] = []
+    if extracted_tasks:
+        roles_map = {((row["username"] or "").lower()): row for row in storage.list_roles(chat_id)}
+
+        for task_item in extracted_tasks[:10]:
+            title = str(task_item.get("title", "")).strip()
+            if not title:
+                continue
+
+            owner_raw = str(task_item.get("owner", "")).strip()
+            owner_key = owner_raw.lstrip("@").lower()
+            role_row = roles_map.get(owner_key)
+            assignee_user_id = str(role_row["user_id"]) if role_row else None
+            assignee_username = role_row["username"] if role_row else None
+            assignee_label = assignee_username or owner_raw or "unassigned"
+
+            due_candidate = str(task_item.get("due_date", "")).strip()
+            due_date = due_candidate if re.fullmatch(r"\d{4}-\d{2}-\d{2}", due_candidate) else None
+
+            task_id = storage.create_task(
+                chat_id=chat_id,
+                title=title,
+                assignee_user_id=assignee_user_id,
+                assignee_username=assignee_username,
+                due_date=due_date,
+                created_at=utc_now_iso(),
+            )
+
+            await memory.retain_event(
+                bank_id=bank_id,
+                content=f"Task #{task_id} created from meeting analysis: {title}. Owner: {assignee_label}",
+                context="Task extraction",
+                tags=[f"team:{chat_id}", f"session:{session_id}", "topic:tasks", "status:open"],
+                metadata={"source": "telegram", "task_id": str(task_id)},
+            )
+
+            created_lines.append(
+                f"- #{task_id} {title} | owner: {assignee_label} | due: {due_date or 'no due date'}"
+            )
+
+    if created_lines:
+        await update.message.reply_text("LLM-created tasks:\n" + "\n".join(created_lines))
 
     storage.clear_active_session(chat_id)
     storage.clear_transcript(chat_id, session_id)
@@ -346,6 +431,14 @@ async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     bank_id = chat_bank_id(update)
+    transcript_row = storage.get_transcript(chat_id, active["session_id"])
+    if not transcript_row or not str(transcript_row["content"] or "").strip():
+        await update.message.reply_text(
+            "No meeting transcript captured yet. "
+            "If your team is chatting but bot sees only commands, disable privacy mode via BotFather (/setprivacy)."
+        )
+        return
+
     try:
         text = await memory.meeting_summary(
             bank_id=bank_id,
@@ -444,6 +537,13 @@ async def _extract_message_text(update: Update) -> str | None:
             return None
         return message.text.strip()
 
+    if message.document:
+        file_name = message.document.file_name or "document"
+        caption = (message.caption or "").strip()
+        if caption:
+            return f"[Document shared: {file_name}] {caption}"
+        return f"[Document shared: {file_name}]"
+
     media = message.voice or message.audio
     if not media:
         return None
@@ -539,7 +639,7 @@ def main() -> None:
     app.add_handler(CommandHandler("guide", guide))
     app.add_handler(
         MessageHandler(
-            (filters.TEXT & (~filters.COMMAND)) | filters.VOICE | filters.AUDIO,
+            (filters.TEXT & (~filters.COMMAND)) | filters.VOICE | filters.AUDIO | filters.Document.ALL,
             capture_meeting_message,
         )
     )

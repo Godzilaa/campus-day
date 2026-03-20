@@ -6,8 +6,11 @@ from openai import OpenAI
 
 
 class VoiceTranscriber:
-    def __init__(self, api_key: str, model: str = "whisper-1") -> None:
-        self._client = OpenAI(api_key=api_key)
+    def __init__(self, api_key: str, model: str = "whisper-1", base_url: str | None = None) -> None:
+        if base_url:
+            self._client = OpenAI(api_key=api_key, base_url=base_url)
+        else:
+            self._client = OpenAI(api_key=api_key)
         self._model = model
 
     def transcribe(self, file_path: str) -> str:

@@ -192,3 +192,46 @@ class HindsightProjectMemory:
             budget="mid",
         )
         return getattr(response, "text", "") or "No guidance generated yet."
+
+    async def extract_action_items(self, bank_id: str, chat_id: str, session_id: str) -> list[dict[str, Any]]:
+        schema: dict[str, Any] = {
+            "type": "object",
+            "properties": {
+                "tasks": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "title": {"type": "string"},
+                            "owner": {"type": "string"},
+                            "due_date": {"type": "string"},
+                            "notes": {"type": "string"},
+                        },
+                        "required": ["title"],
+                    },
+                }
+            },
+            "required": ["tasks"],
+        }
+
+        response = await self._client.areflect(
+            bank_id=bank_id,
+            query=(
+                "Extract concrete action items from this meeting. Return only tasks that were clearly implied or "
+                "explicitly discussed. For each task include title, suggested owner (if known), due_date in YYYY-MM-DD "
+                "if present, and short notes."
+            ),
+            tags=[f"team:{chat_id}", f"session:{session_id}"],
+            tags_match="all",
+            budget="mid",
+            response_schema=schema,
+        )
+
+        structured = getattr(response, "structured_output", None)
+        if not structured:
+            return []
+
+        tasks = structured.get("tasks", [])
+        if not isinstance(tasks, list):
+            return []
+        return tasks

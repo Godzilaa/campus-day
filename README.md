@@ -53,8 +53,8 @@ cp .env.example .env
 - `HINDSIGHT_API_KEY` (required for Hindsight Cloud)
 - `HINDSIGHT_BANK_PREFIX`
 - `REMINDER_HOUR_UTC`
-- `OPENAI_API_KEY` (required for voice note transcription)
-- `OPENAI_TRANSCRIBE_MODEL` (default: `whisper-1`)
+- `OPENAI_API_KEY` (optional for voice note transcription)
+- `OPENAI_TRANSCRIBE_MODEL` (default: `whisper-1`; for Groq use `whisper-large-v3-turbo`)
 - `GROQ_API_KEY` (required for `/guide` role-based LLM guidance)
 - `GROQ_MODEL` (default: `openai/gpt-oss-120b`)
 - `WEBHOOK_MODE` (`true` for webhook mode, `false` for polling)
@@ -67,6 +67,10 @@ Hindsight Cloud option:
 - Open https://ui.hindsight.vectorize.io/connect and sign in.
 - Copy the API URL into `HINDSIGHT_BASE_URL` and API key into `HINDSIGHT_API_KEY`.
 - Run the bot normally; no local Hindsight server is needed in cloud mode.
+
+Voice transcription with Groq:
+- If `OPENAI_API_KEY` is empty and `GROQ_API_KEY` is set, the bot will use Groq's OpenAI-compatible endpoint for transcription.
+- Recommended model: `OPENAI_TRANSCRIBE_MODEL=whisper-large-v3-turbo`.
 
 5. Start the bot:
 
